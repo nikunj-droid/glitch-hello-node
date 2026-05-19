@@ -1,119 +1,83 @@
-/**
- * This is the main Node.js server script for your project
- * Check out the two endpoints this back-end API provides in fastify.get and fastify.post below
- */
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const path = require('path');
 
-const path = require("path");
-
-// Require the fastify framework and instantiate it
-const fastify = require("fastify")({
-  // Set this to true for detailed logging:
-  logger: false,
+const app = express();
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, {
+  cors: { origin: '*' }
 });
 
-// ADD FAVORITES ARRAY VARIABLE FROM TODO HERE
+// ── GAME STATE ────────────────────────────────────────
+const HOST_SECRET = 'MATKAKING'; // host enters this as their name
 
-// Setup our static files
-fastify.register(require("@fastify/static"), {
-  root: path.join(__dirname, "public"),
-  prefix: "/", // optional: default '/'
-});
+const game = {
+  players: {},      // socketId -> { name, bets, plays, picks, locked }
+  draws: {},        // r1/r2/r3 -> [{ v, suit, red }]
+  phase: 'lobby'   // lobby | picking | waiting | drawing
+};
 
-// Formbody lets us parse incoming forms
-fastify.register(require("@fastify/formbody"));
+// ── STATIC ───────────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
-// View is a templating manager for fastify
-fastify.register(require("@fastify/view"), {
-  engine: {
-    handlebars: require("handlebars"),
-  },
-});
+// ── SOCKET ───────────────────────────────────────────
+const VALS = ['A','2','3','4','5','6','7','8','9','10','J','Q','K'];
 
-// Load and parse SEO data
-const seo = require("./src/seo.json");
-if (seo.url === "glitch-default") {
-  seo.url = `https://${process.env.PROJECT_DOMAIN}.glitch.me`;
-}
+io.on('connection', (socket) => {
+  console.log('connect', socket.id);
 
-/**
- * Our home page route
- *
- * Returns src/pages/index.hbs with data built into it
- */
-fastify.get("/", function (request, reply) {
-  // params is an object we'll pass to our handlebars template
-  let params = { seo: seo };
+  // Send current state on connect
+  socket.emit('game:state', {
+    phase: game.phase,
+    playerCount: Object.keys(game.players).length,
+    draws: game.draws
+  });
 
-  // If someone clicked the option for a random color it'll be passed in the querystring
-  if (request.query.randomize) {
-    // We need to load our color data file, pick one at random, and add it to the params
-    const colors = require("./src/colors.json");
-    const allColors = Object.keys(colors);
-    let currentColor = allColors[(allColors.length * Math.random()) << 0];
+  // Player joins
+  socket.on('player:join', (data) => {
+    const { name, bets, plays, picks } = data;
+    const isHost = name.toUpperCase().replace(/\s/g,'') === HOST_SECRET;
+    game.players[socket.id] = { name, bets, plays, picks, locked: {r1:true,r2:true,r3:true}, isHost };
+    socket.emit('player:joined', { isHost, playerCount: Object.keys(game.players).length });
+    io.emit('lobby:update', { playerCount: Object.keys(game.players).length });
+    console.log(`${name} joined (host:${isHost})`);
+  });
 
-    // Add the color properties to the params object
-    params = {
-      color: colors[currentColor],
-      colorError: null,
-      seo: seo,
-    };
-  }
-
-  // The Handlebars code will be able to access the parameter values and build them into the page
-  return reply.view("/src/pages/index.hbs", params);
-});
-
-/**
- * Our POST route to handle and react to form submissions
- *
- * Accepts body data indicating the user choice
- */
-fastify.post("/", function (request, reply) {
-  // Build the params object to pass to the template
-  let params = { seo: seo };
-
-  // If the user submitted a color through the form it'll be passed here in the request body
-  let color = request.body.color;
-
-  // If it's not empty, let's try to find the color
-  if (color) {
-    // ADD CODE FROM TODO HERE TO SAVE SUBMITTED FAVORITES
-
-    // Load our color data file
-    const colors = require("./src/colors.json");
-
-    // Take our form submission, remove whitespace, and convert to lowercase
-    color = color.toLowerCase().replace(/\s/g, "");
-
-    // Now we see if that color is a key in our colors object
-    if (colors[color]) {
-      // Found one!
-      params = {
-        color: colors[color],
-        colorError: null,
-        seo: seo,
-      };
-    } else {
-      // No luck! Return the user value as the error property
-      params = {
-        colorError: request.body.color,
-        seo: seo,
-      };
+  // Host draws a round
+  socket.on('host:draw', ({ round }) => {
+    const player = game.players[socket.id];
+    if (!player || !player.isHost) return;
+    const count = { 1:1, 2:2, 3:3 }[round];
+    const drawn = [];
+    for (let i = 0; i < count; i++) {
+      const v = VALS[Math.floor(Math.random() * VALS.length)];
+      const red = Math.random() < 0.5;
+      drawn.push({ v, suit: red ? (Math.random()<0.5?'♥':'♦') : (Math.random()<0.5?'♠':'♣'), red });
     }
-  }
+    game.draws['r'+round] = drawn;
+    // Broadcast to ALL players
+    io.emit('round:drawn', { round, drawn });
+    console.log(`R${round} drawn:`, drawn.map(d=>d.v).join(', '));
+  });
 
-  // The Handlebars template will use the parameter values to update the page with the chosen color
-  return reply.view("/src/pages/index.hbs", params);
+  // Host resets game
+  socket.on('host:reset', () => {
+    const player = game.players[socket.id];
+    if (!player || !player.isHost) return;
+    game.draws = {};
+    game.players = {};
+    io.emit('game:reset');
+    console.log('Game reset by host');
+  });
+
+  socket.on('disconnect', () => {
+    delete game.players[socket.id];
+    io.emit('lobby:update', { playerCount: Object.keys(game.players).length });
+    console.log('disconnect', socket.id);
+  });
 });
 
-// Run the server and report out to the logs
-fastify.listen(
-  { port: process.env.PORT, host: "0.0.0.0" },
-  function (err, address) {
-    if (err) {
-      console.error(err);
-      process.exit(1);
-    }
-    console.log(`Your app is listening on ${address}`);
-  }
-);
+const PORT = process.env.PORT || 3000;
+httpServer.listen(PORT, () => console.log(`Matka King running on port ${PORT}`));
